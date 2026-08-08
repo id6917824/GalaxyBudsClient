@@ -88,6 +88,44 @@ public static class MultipointPatcher
     private static DateTime _suppressUntil = DateTime.MinValue;
 
     /// <summary>
+    /// The earbuds do not always accept a connection on their SPP4 server. Every spurious
+    /// Connected event would otherwise start another doomed sequence, and each one costs a
+    /// disconnect and a reconnect, so a failure buys a pause before the next attempt.
+    /// </summary>
+    private const int FailureBackoffMs = 60000;
+
+    private static DateTime _retryNotBefore = DateTime.MinValue;
+
+    /// <summary>
+    /// How often to retry within one connection before giving up on it. Each attempt costs the user
+    /// a dropped audio link, so a device that keeps refusing the write must not be retried for as
+    /// long as it stays connected. The next real disconnect starts the count over.
+    /// </summary>
+    private const int MaxAttemptsPerSession = 3;
+
+    private static int _failedAttempts;
+
+    /// <summary>
+    /// Whether the sequence found the earbuds unreachable when it went to restore the session.
+    /// A failure caused by the earbuds leaving must not be held against the next connection.
+    /// </summary>
+    private static bool _earbudsWentAway;
+
+    /// <summary>
+    /// Whether the current connection has already been patched.
+    ///
+    /// <see cref="BluetoothImpl.Connected"/> does not only fire when the earbuds come back: the
+    /// macOS backend re-establishes the RFCOMM channel whenever the OS reports the device
+    /// connecting, and raises the event again without the link ever having dropped. Idle Buds2 Pro
+    /// produced five of those in twenty minutes. Patching each one would tear the session down
+    /// every few minutes for no gain, because the value written is still in place.
+    ///
+    /// A power cycle does drop the link, so it clears this flag and the next connection is patched
+    /// again - which is what makes the value come back after a trip to the charging case.
+    /// </summary>
+    private static bool _patchedThisSession;
+
+    /// <summary>
     /// The SMEP channel is only exposed by models that also support renaming, which is the same
     /// set of devices this patch applies to.
     /// </summary>
@@ -97,6 +135,28 @@ public static class MultipointPatcher
     public static void Init()
     {
         BluetoothImpl.Instance.Connected += OnConnected;
+        BluetoothImpl.Instance.Disconnected += OnDisconnected;
+    }
+
+    /// <summary>
+    /// Ends the patched session so that the next connection is written to again.
+    ///
+    /// This is deliberately driven by the disconnect rather than by a timer: the earbuds can be
+    /// taken out of the case within a few seconds of going in, and that is exactly the moment the
+    /// value has to be rewritten. Any debounce measured in time would swallow it.
+    ///
+    /// Our own sequence disconnects on purpose, and that teardown is not the earbuds going away,
+    /// so it is ignored while the sequence holds the lock.
+    /// </summary>
+    private static void OnDisconnected(object? sender, string reason)
+    {
+        if (Lock.CurrentCount == 0)
+            return;
+
+        _patchedThisSession = false;
+        _suppressUntil = DateTime.MinValue;
+        _retryNotBefore = DateTime.MinValue;
+        _failedAttempts = 0;
     }
 
     private static async void OnConnected(object? sender, EventArgs e)
@@ -110,6 +170,16 @@ public static class MultipointPatcher
             if (DateTime.UtcNow < _suppressUntil)
                 return;
 
+            /* The link never dropped, so what we wrote is still there */
+            if (_patchedThisSession)
+                return;
+
+            if (DateTime.UtcNow < _retryNotBefore)
+                return;
+
+            if (_failedAttempts >= MaxAttemptsPerSession)
+                return;
+
             if (!IsSupportedByCurrentDevice)
             {
                 Log.Debug("MultipointPatcher: {Model} has no SMEP channel, skipping",
@@ -117,10 +187,14 @@ public static class MultipointPatcher
                 return;
             }
 
-            /* Let the regular session settle before tearing it down for the patch sequence */
+            /*
+             * The earbuds do not have their SPP4 server up the moment they report themselves
+             * connected - the first open attempt after a connect reliably fails - so give them a
+             * moment. Whether the connection is still up is not checked here on purpose: that
+             * answer is stale by the time it is read, and the sequence connects for itself
+             * anyway. Only an actual RFCOMM open decides whether this can proceed.
+             */
             await Task.Delay(SettleDelayMs);
-            if (!BluetoothImpl.Instance.IsConnected)
-                return;
 
             await ApplyAsync();
         }
@@ -150,7 +224,33 @@ public static class MultipointPatcher
              * for up to 3s inside the native call), and callers reach us from the UI thread, so the
              * whole sequence has to run off it.
              */
-            return await Task.Run(RunAsync);
+            var applied = await Task.Run(RunAsync);
+
+            if (applied)
+            {
+                _patchedThisSession = true;
+            }
+            else if (_earbudsWentAway)
+            {
+                /* Whatever went wrong, the earbuds are gone; their next connection is a new session */
+                Log.Information("MultipointPatcher: The earbuds went away mid-sequence, retrying when they return");
+                _patchedThisSession = false;
+                _failedAttempts = 0;
+                _retryNotBefore = DateTime.MinValue;
+                /* The restore reconnect never happened, so there is no echo left to suppress */
+                _suppressUntil = DateTime.MinValue;
+            }
+            else
+            {
+                _failedAttempts++;
+                _retryNotBefore = DateTime.UtcNow.AddMilliseconds(FailureBackoffMs);
+
+                if (_failedAttempts >= MaxAttemptsPerSession)
+                    Log.Warning("MultipointPatcher: Giving up after {Count} attempts on this connection",
+                        _failedAttempts);
+            }
+
+            return applied;
         }
         finally
         {
@@ -162,6 +262,7 @@ public static class MultipointPatcher
     {
         var bt = BluetoothImpl.Instance;
         var wasConnected = bt.IsConnected;
+        _earbudsWentAway = false;
 
         try
         {
@@ -188,25 +289,25 @@ public static class MultipointPatcher
 
             var reported = await WriteAndReadBackAsync();
 
-            /* SendAltAsync swallows send failures, so the channel state is our only feedback */
-            if (!bt.IsConnectedAlternative)
-            {
-                Log.Error("MultipointPatcher: SMEP channel dropped while writing MDE_VERSION");
-                return false;
-            }
-
             switch (reported)
             {
                 case 2 or 3:
+                    /* The earbuds reported the new value themselves, which outranks any local state */
                     Log.Information("MultipointPatcher: MDE_VERSION written and verified, asVer={AsVer}", reported);
                     return true;
                 case { } other:
                     Log.Error("MultipointPatcher: Wrote asVer=2, but the earbuds report {AsVer}", other);
                     return false;
                 default:
-                    /* The write itself did not fail, so this is not an error, but nothing confirms it either */
-                    Log.Warning("MultipointPatcher: MDE_VERSION written, but the earbuds reported no state to verify it against");
-                    return true;
+                    /*
+                     * A write is always answered, so silence means it never landed - the channel
+                     * dropped mid-sequence, or the earbuds never processed the frame. Nothing here
+                     * distinguishes those, and calling it a success would mark the session patched
+                     * on no evidence and leave multipoint off until the next power cycle.
+                     */
+                    Log.Error("MultipointPatcher: Wrote MDE_VERSION, but the earbuds reported no state back " +
+                              "(SMEP channel up: {Alt})", bt.IsConnectedAlternative);
+                    return false;
             }
         }
         catch (Exception ex)
@@ -337,7 +438,14 @@ public static class MultipointPatcher
             if (reconnect)
             {
                 _suppressUntil = DateTime.UtcNow.AddMilliseconds(SelfReconnectSuppressMs);
-                await bt.ConnectAsync();
+
+                /*
+                 * A session we could reach a moment ago and cannot reach now means the earbuds
+                 * themselves went away - almost always into the charging case, which is exactly
+                 * what wipes asVer. While alt mode is on their disconnect is reported as an alt
+                 * disconnect, so this is the only place the sequence learns about it.
+                 */
+                _earbudsWentAway = !await bt.ConnectAsync();
             }
         }
         catch (Exception ex)
